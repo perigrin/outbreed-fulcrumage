@@ -1,0 +1,266 @@
+// XS implementation for field access and binary serialization
+#define PERL_NO_GET_CONTEXT
+#include "EXTERN.h"
+#include "perl.h"
+#include "XSUB.h"
+
+#include "ppport.h"
+
+// Direct field access functions from perlclassguts
+// These would be properly included in a real implementation
+extern SV** ObjectFIELDS(SV* obj);
+extern I32 ObjFIELDS_count(SV* obj);
+extern bool ObjFIELDS_alloc(SV* obj, I32 count);
+
+// Helper function to ensure we have a class object (SVt_PVOBJ)
+static bool is_class_object(SV* sv) {
+    if (!sv || !SvROK(sv))
+        return FALSE;
+    
+    SV* ref = SvRV(sv);
+    return (SvTYPE(ref) == SVt_PVOBJ);
+}
+
+// Serialize a Perl 5.40 class object to binary data
+static SV* serialize_object(SV* obj) {
+    if (!is_class_object(obj))
+        croak("Not a Perl 5.40 class object");
+    
+    SV* ref = SvRV(obj);
+    
+    // Get the package name
+    HV* stash = SvSTASH(ref);
+    const char* package = HvNAME(stash);
+    
+    // Get fields and count
+    SV** fields = ObjectFIELDS(ref);
+    I32 field_count = ObjFIELDS_count(ref);
+    
+    if (!fields || field_count < 0)
+        croak("Could not access object fields");
+    
+    // Start the output buffer
+    SV* buffer = newSV(0);
+    sv_setpvn(buffer, "", 0);
+    
+    // Format:
+    // - 1 byte type marker ('O' for object)
+    // - package name (null terminated)
+    // - number of fields (4 bytes)
+    // - fields data (variable)
+    
+    // Write header
+    sv_catpvn(buffer, "O", 1);  // Object type marker
+    sv_catpv(buffer, package);   // Package name
+    sv_catpvn(buffer, "\0", 1);  // Null terminator
+    sv_catpvn(buffer, (char*)&field_count, sizeof(field_count));  // Field count
+    
+    // Write each field
+    I32 i;
+    for (i = 0; i < field_count; i++) {
+        SV* field = fields[i];
+        
+        if (!field || !SvOK(field)) {
+            // Undefined field
+            unsigned char type = 0;
+            sv_catpvn(buffer, (char*)&type, 1);
+            continue;
+        }
+        
+        // Handle field based on its type
+        if (SvIOK(field)) {
+            // Integer
+            unsigned char type = 1;
+            IV value = SvIV(field);
+            
+            sv_catpvn(buffer, (char*)&type, 1);
+            sv_catpvn(buffer, (char*)&value, sizeof(value));
+        }
+        else if (SvNOK(field)) {
+            // Double/float
+            unsigned char type = 2;
+            NV value = SvNV(field);
+            
+            sv_catpvn(buffer, (char*)&type, 1);
+            sv_catpvn(buffer, (char*)&value, sizeof(value));
+        }
+        else if (SvPOK(field)) {
+            // String
+            unsigned char type = 3;
+            STRLEN len;
+            char* pv = SvPV(field, len);
+            
+            sv_catpvn(buffer, (char*)&type, 1);
+            sv_catpvn(buffer, (char*)&len, sizeof(len));
+            sv_catpvn(buffer, pv, len);
+        }
+        else {
+            // Not a simple scalar type, store as undefined
+            // No support for complex types in first draft
+            unsigned char type = 0;
+            sv_catpvn(buffer, (char*)&type, 1);
+        }
+    }
+    
+    return buffer;
+}
+
+// Deserialize binary data back to a Perl 5.40 class object
+// Without calling the constructor, directly creating and populating the object
+static SV* deserialize_object(SV* binary) {
+    STRLEN data_len;
+    char* data = SvPV(binary, data_len);
+    char* cur = data;
+    
+    // Validate minimal length
+    if (data_len < 3)
+        croak("Invalid binary data: too short");
+    
+    // Check type marker
+    if (*cur != 'O')
+        croak("Invalid binary data: not an object");
+    cur++;
+    
+    // Extract package name
+    char* package = cur;
+    while (*cur && (size_t)(cur - data) < data_len)
+        cur++;
+    
+    if ((size_t)(cur - data) >= data_len)
+        croak("Invalid binary data: missing null terminator");
+    
+    // Skip null terminator
+    cur++;
+    
+    // Extract field count
+    if ((size_t)(cur - data + sizeof(I32)) > data_len)
+        croak("Invalid binary data: missing field count");
+    
+    I32 field_count = *(I32*)cur;
+    cur += sizeof(I32);
+    
+    // Create the stash (package symbol table)
+    HV* stash = gv_stashpv(package, GV_ADD);
+    if (!stash)
+        croak("Could not find package '%s'", package);
+    
+    // Create a new object directly without calling constructor
+    SV* obj = sv_setref_pvn(newSV(0), package, "", 0);
+    if (!obj)
+        croak("Could not create object");
+    
+    SV* ref = SvRV(obj);
+    
+    // Upgrade to SVt_PVOBJ if needed
+    if (SvTYPE(ref) != SVt_PVOBJ) {
+        sv_upgrade(ref, SVt_PVOBJ);
+    }
+    
+    // Allocate space for fields
+    if (!ObjFIELDS_alloc(ref, field_count))
+        croak("Could not allocate fields");
+    
+    // Get field array
+    SV** fields = ObjectFIELDS(ref);
+    if (!fields)
+        croak("Could not get fields");
+    
+    // Deserialize each field
+    I32 i;
+    for (i = 0; i < field_count; i++) {
+        // Check if we've reached the end of the data
+        if ((size_t)(cur - data) >= data_len)
+            break;
+        
+        // Get field type
+        unsigned char type = *cur++;
+        
+        // Create field based on type
+        SV* field = NULL;
+        
+        switch (type) {
+            case 0: // Undefined
+                field = newSV(0);
+                break;
+                
+            case 1: // Integer
+                if ((size_t)(cur - data + sizeof(IV)) <= data_len) {
+                    IV value = *(IV*)cur;
+                    cur += sizeof(IV);
+                    field = newSViv(value);
+                }
+                break;
+                
+            case 2: // Double/float
+                if ((size_t)(cur - data + sizeof(NV)) <= data_len) {
+                    NV value = *(NV*)cur;
+                    cur += sizeof(NV);
+                    field = newSVnv(value);
+                }
+                break;
+                
+            case 3: // String
+                if ((size_t)(cur - data + sizeof(STRLEN)) <= data_len) {
+                    STRLEN len = *(STRLEN*)cur;
+                    cur += sizeof(STRLEN);
+                    
+                    if ((size_t)(cur - data + len) <= data_len) {
+                        field = newSVpvn(cur, len);
+                        cur += len;
+                    }
+                }
+                break;
+                
+            default: // Unknown type
+                field = newSV(0);
+                break;
+        }
+        
+        // Set field in object
+        if (field) {
+            fields[i] = field;
+        } else {
+            fields[i] = newSV(0);
+        }
+    }
+    
+    return obj;
+}
+
+MODULE = ECS::XS::Binary    PACKAGE = ECS::XS::Binary
+
+SV*
+serialize(obj)
+    SV* obj
+    CODE:
+        RETVAL = serialize_object(obj);
+    OUTPUT:
+        RETVAL
+
+SV*
+deserialize(binary)
+    SV* binary
+    CODE:
+        RETVAL = deserialize_object(binary);
+    OUTPUT:
+        RETVAL
+
+bool
+is_class_object(sv)
+    SV* sv
+    CODE:
+        RETVAL = is_class_object(sv);
+    OUTPUT:
+        RETVAL
+
+I32
+field_count(obj)
+    SV* obj
+    CODE:
+        if (!is_class_object(obj))
+            croak("Not a Perl 5.40 class object");
+        
+        SV* ref = SvRV(obj);
+        RETVAL = ObjFIELDS_count(ref);
+    OUTPUT:
+        RETVAL

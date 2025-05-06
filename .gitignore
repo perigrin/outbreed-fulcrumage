@@ -1,0 +1,7 @@
+**/.claude/settings.local.json
+check_svtype.pl
+run_tests.sh
+test_module.pl
+Makefile.
+Makefile.old
+CLAUDE.md

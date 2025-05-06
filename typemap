@@ -1,0 +1,4 @@
+# Basic typemap for ECS::XS::Binary
+
+TYPEMAP
+bool    T_BOOL

@@ -1,0 +1,9 @@
+lib/ECS/XS/Binary.pm
+Binary.xs
+t/001-basic.t
+t/002-performance.t
+Makefile.PL
+README.md
+typemap
+MANIFEST
+ppport.h

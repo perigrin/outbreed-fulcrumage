@@ -47,7 +47,7 @@ subtest 'Object identification' => sub {
     # Dies on non-object
     like(
         dies { field_count($hashref) },
-        qr/Not a Perl 5\.40 class object/,
+        qr/Not a feature class object/,
         'field_count dies on non-class object'
     );
 };
@@ -148,7 +148,7 @@ subtest 'Error handling' => sub {
     my $hashref = { x => 10, y => 20, z => 30 };
     like(
         dies { serialize($hashref) },
-        qr/Not a Perl 5\.40 class object/,
+        qr/Not a feature class object/,
         'Serialize dies on non-class object'
     );
 };

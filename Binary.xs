@@ -6,6 +6,11 @@
 
 #include "ppport.h"
 
+// Include DuckDB header if available
+#ifdef HAVE_DUCKDB
+#include "duckdb.h"
+#endif
+
 // Perl 5.40 class object APIs
 // SVt_PVOBJ is a new SV type introduced in Perl 5.40 for class objects
 // This should match the actual value in the running Perl
@@ -428,6 +433,124 @@ static SV* deserialize_object(SV* binary) {
     return obj;
 }
 
+#ifdef HAVE_DUCKDB
+/* DuckDB struct and helper functions */
+
+/* DuckDB connection type for internal use */
+typedef struct {
+    duckdb_database db;
+    duckdb_connection conn;
+    int is_open;
+} duckdb_handle;
+
+/* Function prototypes for internal use */
+static duckdb_handle* duckdb_internal_connect(const char* path);
+static void duckdb_internal_disconnect(duckdb_handle* handle);
+static int duckdb_internal_execute(duckdb_handle* handle, const char* query);
+static int duckdb_internal_store_object(duckdb_handle* handle, const char* collection, SV* obj);
+
+/* Implementation of internal functions */
+static duckdb_handle* duckdb_internal_connect(const char* path) {
+    duckdb_handle* handle = (duckdb_handle*)safemalloc(sizeof(duckdb_handle));
+    if (!handle) {
+        return NULL;
+    }
+    
+    /* Initialize the database */
+    if (duckdb_open(path, &handle->db) != DuckDBSuccess) {
+        Safefree(handle);
+        return NULL;
+    }
+    
+    /* Create a connection */
+    if (duckdb_connect(handle->db, &handle->conn) != DuckDBSuccess) {
+        duckdb_close(&handle->db);
+        Safefree(handle);
+        return NULL;
+    }
+    
+    handle->is_open = 1;
+    return handle;
+}
+
+static void duckdb_internal_disconnect(duckdb_handle* handle) {
+    if (!handle || !handle->is_open) {
+        return;
+    }
+    
+    duckdb_disconnect(&handle->conn);
+    duckdb_close(&handle->db);
+    handle->is_open = 0;
+    Safefree(handle);
+}
+
+static int duckdb_internal_execute(duckdb_handle* handle, const char* query) {
+    if (!handle || !handle->is_open) {
+        return 0;
+    }
+    
+    return (duckdb_query(handle->conn, query, NULL) == DuckDBSuccess);
+}
+
+static int duckdb_internal_store_object(duckdb_handle* handle, const char* collection, SV* obj) {
+    if (!handle || !handle->is_open || !collection) {
+        return 0;
+    }
+    
+    /* Validate object */
+    if (!is_class_object(obj)) {
+        return 0;
+    }
+    
+    /* Get class name */
+    SV* ref = SvRV(obj);
+    HV* stash = SvSTASH(ref);
+    const char* class_name = HvNAME(stash);
+    
+    /* Serialize the object */
+    SV* binary = serialize_object(obj);
+    STRLEN binary_len;
+    const char* binary_data = SvPV_const(binary, binary_len);
+    
+    /* Ensure the collection exists */
+    char create_query[1024];
+    sprintf(create_query, "CREATE TABLE IF NOT EXISTS %s (id INTEGER PRIMARY KEY, class_name TEXT, binary_data BLOB)", 
+            collection);
+    
+    if (!duckdb_internal_execute(handle, create_query)) {
+        SvREFCNT_dec(binary);
+        return 0;
+    }
+    
+    /* Prepare statement for insert */
+    duckdb_prepared_statement stmt;
+    char query[1024];
+    sprintf(query, "INSERT INTO %s (class_name, binary_data) VALUES (?, ?)", collection);
+    
+    if (duckdb_prepare(handle->conn, query, &stmt) != DuckDBSuccess) {
+        SvREFCNT_dec(binary);
+        return 0;
+    }
+    
+    /* Bind parameters */
+    int success = 1;
+    if (duckdb_bind_varchar(stmt, 1, class_name) != DuckDBSuccess ||
+        duckdb_bind_blob(stmt, 2, binary_data, binary_len) != DuckDBSuccess) {
+        success = 0;
+    }
+    
+    /* Execute and clean up */
+    if (success && duckdb_execute_prepared(stmt, NULL) != DuckDBSuccess) {
+        success = 0;
+    }
+    
+    duckdb_destroy_prepare(&stmt);
+    SvREFCNT_dec(binary);
+    
+    return success;
+}
+#endif /* HAVE_DUCKDB */
+
 MODULE = ECS::XS::Binary    PACKAGE = ECS::XS::Binary
 
 SV*
@@ -458,17 +581,17 @@ I32
 field_count(obj)
     SV* obj
     CODE:
-        // Validate input
+        /* Validate input */
         if (!obj || !SvROK(obj))
             croak("Not a valid object reference");
             
         if (!is_class_object(obj))
             croak("Not a Perl 5.40 class object");
         
-        // Get the actual object
+        /* Get the actual object */
         SV* ref = SvRV(obj);
         
-        // Get field count
+        /* Get field count */
         I32 count = ObjFIELDS_count(ref);
         if (count < 0)
             croak("Invalid field count");
@@ -476,3 +599,163 @@ field_count(obj)
         RETVAL = count;
     OUTPUT:
         RETVAL
+
+SV*
+create_world()
+    CODE:
+        SV* world;
+        dSP;
+        
+        ENTER;
+        SAVETMPS;
+        
+        PUSHMARK(SP);
+        XPUSHs(sv_2mortal(newSVpv("ECS::XS::Binary::World", 0)));
+        PUTBACK;
+        
+        int count = call_method("new", G_SCALAR);
+        
+        SPAGAIN;
+        
+        if (count != 1)
+            croak("Failed to create world object");
+            
+        world = POPs;
+        SvREFCNT_inc(world);
+        
+        PUTBACK;
+        FREETMPS;
+        LEAVE;
+        
+        RETVAL = world;
+    OUTPUT:
+        RETVAL
+
+#ifdef HAVE_DUCKDB
+
+SV*
+store_object(db_path, collection, obj)
+    const char* db_path
+    const char* collection
+    SV* obj
+    CODE:
+        /* Validate the object is a proper Perl 5.40 class object */
+        if (!is_class_object(obj)) {
+            croak("Not a Perl 5.40 class object");
+        }
+        
+        /* Connect to the database */
+        duckdb_handle* handle = duckdb_internal_connect(db_path);
+        if (!handle) {
+            croak("Failed to connect to database at %s", db_path);
+        }
+        
+        /* Store the object */
+        int success = duckdb_internal_store_object(handle, collection, obj);
+        
+        /* Disconnect */
+        duckdb_internal_disconnect(handle);
+        
+        if (!success) {
+            croak("Failed to store object in collection %s", collection);
+        }
+        
+        /* Return true on success */
+        RETVAL = newSViv(1);
+    OUTPUT:
+        RETVAL
+
+void
+retrieve_objects(db_path, collection, class_name, ...)
+    const char* db_path
+    const char* collection
+    const char* class_name
+    PPCODE:
+        /* Connect to the database */
+        duckdb_handle* handle = duckdb_internal_connect(db_path);
+        if (!handle) {
+            croak("Failed to connect to database at %s", db_path);
+        }
+        
+        /* Optional WHERE clause */
+        const char* where_clause = "";
+        if (items > 3) {
+            where_clause = SvPV_nolen(ST(3));
+        }
+        
+        /* Build the query */
+        char query[1024];
+        sprintf(query, "SELECT binary_data FROM %s WHERE class_name = '%s' %s", 
+                collection, class_name, where_clause);
+        
+        /* Execute the query */
+        duckdb_result result;
+        if (duckdb_query(handle->conn, query, &result) != DuckDBSuccess) {
+            duckdb_internal_disconnect(handle);
+            const char* error = duckdb_result_error(&result);
+            croak("Failed to retrieve objects: %s", error ? error : "Unknown error");
+        }
+        
+        /* Process each row */
+        idx_t row_count = duckdb_row_count(&result);
+        if (row_count > 0) {
+            EXTEND(SP, row_count);
+            
+            idx_t i;
+            for (i = 0; i < row_count; i++) {
+                /* Get the binary data using correct DuckDB API functions */
+                /* duckdb_blob contains both data and size fields */
+                duckdb_blob blob_result = duckdb_value_blob(&result, 0, i);
+                const void* binary_data = blob_result.data;
+                idx_t binary_len = blob_result.size;
+                
+                /* Create a Perl scalar with the binary data */
+                SV* binary = newSVpvn((const char*)binary_data, binary_len);
+                
+                /* Deserialize to object */
+                SV* obj = deserialize_object(binary);
+                
+                /* Add to the result stack */
+                PUSHs(sv_2mortal(obj));
+                
+                /* Free the temporary binary value */
+                SvREFCNT_dec(binary);
+            }
+        }
+        
+        /* Clean up */
+        duckdb_destroy_result(&result);
+        duckdb_internal_disconnect(handle);
+
+void
+delete_objects(db_path, collection, class_name, ...)
+    const char* db_path
+    const char* collection
+    const char* class_name
+    CODE:
+        /* Connect to the database */
+        duckdb_handle* handle = duckdb_internal_connect(db_path);
+        if (!handle) {
+            croak("Failed to connect to database at %s", db_path);
+        }
+        
+        /* Optional WHERE clause */
+        const char* where_clause = "";
+        if (items > 3) {
+            where_clause = SvPV_nolen(ST(3));
+        }
+        
+        /* Build the query */
+        char query[1024];
+        sprintf(query, "DELETE FROM %s WHERE class_name = '%s' %s", 
+                collection, class_name, where_clause);
+        
+        /* Execute the query */
+        if (!duckdb_internal_execute(handle, query)) {
+            duckdb_internal_disconnect(handle);
+            croak("Failed to delete objects");
+        }
+        
+        duckdb_internal_disconnect(handle);
+
+#endif /* HAVE_DUCKDB */

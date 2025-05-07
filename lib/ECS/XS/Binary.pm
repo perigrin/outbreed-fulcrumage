@@ -11,9 +11,16 @@ our @EXPORT_OK = qw(
     deserialize
     is_class_object
     field_count
+    store_object
+    retrieve_objects
+    delete_objects
+    create_world
 );
 
 XSLoader::load('ECS::XS::Binary', $VERSION);
+
+# Load the World module
+require ECS::XS::Binary::World;
 
 1;
 
@@ -27,29 +34,29 @@ ECS::XS::Binary - Fast binary serialization for Perl 5.40 class objects
 
     use feature 'class';
     use ECS::XS::Binary qw(serialize deserialize);
-    
+
     class Position {
         field $x :param :reader = 0;
         field $y :param :reader = 0;
         field $z :param :reader = 0;
     }
-    
+
     my $pos = Position->new(x => 10, y => 20, z => 30);
-    
+
     # Serialize to binary
     my $binary = serialize($pos);
-    
+
     # Restore without using constructor
     my $restored = deserialize($binary);
-    
+
     print "x: ", $restored->x, "\n";
     print "y: ", $restored->y, "\n";
     print "z: ", $restored->z, "\n";
 
 =head1 DESCRIPTION
 
-This module provides fast binary serialization and deserialization for 
-Perl 5.40 class objects. It directly accesses the internal fields of 
+This module provides fast binary serialization and deserialization for
+Perl 5.40 class objects. It directly accesses the internal fields of
 class objects using the ObjectFIELDS API from perlclassguts.
 
 Deserialization creates objects directly without calling constructors,

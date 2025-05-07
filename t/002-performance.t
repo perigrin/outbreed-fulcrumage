@@ -16,7 +16,7 @@ my $template_obj = Position->new(x => 42, y => 84, z => 126);
 my $template_bin = serialize($template_obj);
 
 subtest 'Constructor vs Deserialization Performance' => sub {
-    my $result = timethese(-5, { # Run for 2 seconds
+    my $result = timethese(-3, { # Run for 2 seconds
         'Constructor' => sub {
             my $p = Position->new(x => 42, y => 84, z => 126);
             # Use $p to prevent optimization

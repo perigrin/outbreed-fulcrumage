@@ -1,5 +1,7 @@
 # ECS::XS::Binary
 
+# THIS CODE IS A PROOF OF CONCEPT ONLY
+
 A high-performance binary serialization system for Perl 5.40 class objects, designed specifically for Entity Component System (ECS) implementations.
 
 ## Overview
@@ -46,7 +48,7 @@ class Position {
     field $x :param :reader = 0;
     field $y :param :reader = 0;
     field $z :param :reader = 0;
-    
+
     method move($dx, $dy, $dz = 0) {
         $x += $dx;
         $y += $dy;

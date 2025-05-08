@@ -1,43 +1,27 @@
-// XS implementation for field access and binary serialization
+// ABOUTME: XS implementation for ECS binary serialization with DuckDB storage
+// ABOUTME: Provides high-performance ECS operations with persistent DuckDB backend
 #define PERL_NO_GET_CONTEXT
 #include "EXTERN.h"
 #include "perl.h"
 #include "XSUB.h"
-
 #include "ppport.h"
+#include <duckdb.h>
+#include <string.h>
+#include <stdio.h>
 
-// Include DuckDB header if available
-#ifdef HAVE_DUCKDB
-#include "duckdb.h"
-#endif
+// ECS DuckDB connection type
+typedef struct {
+    duckdb_database db;
+    duckdb_connection conn;
+    int is_open;
+    char* db_path;
+} ecs_duckdb_handle;
 
-// Helper function to clean up a partially constructed object in case of error
-static void cleanup_object(SV* obj) {
-    if (!obj || !SvROK(obj))
-        return;
-
-    SV* ref = SvRV(obj);
-    if (!ref || SvTYPE(ref) != SVt_PVOBJ)
-        return;
-
-    // Free field SVs if any
-    SV** fields = ObjectFIELDS(ref);
-    if (fields) {
-        I32 count = ObjectMAXFIELD(ref) + 1;
-        I32 i;
-        for (i = 0; i < count; i++) {
-            if (fields[i]) {
-                SvREFCNT_dec(fields[i]);
-                fields[i] = NULL;
-            }
-        }
-        Safefree(fields);
-        ObjectFIELDS(ref) = NULL;
-    }
-
-    // Free the object
-    SvREFCNT_dec(obj);
-}
+// Forward declarations
+static ecs_duckdb_handle* ecs_duckdb_connect(const char* path);
+static void ecs_duckdb_disconnect(ecs_duckdb_handle* handle);
+static int ecs_duckdb_execute(ecs_duckdb_handle* handle, const char* query);
+static int ecs_duckdb_init_schema(ecs_duckdb_handle* handle, const char* world_name);
 
 // Helper function to ensure we have a valid feature class object
 static bool is_class_object(SV* sv) {
@@ -62,33 +46,25 @@ static SV* serialize_object(SV* obj) {
     if (!package)
         croak("Object's stash has no name");
 
-    // Get fields and count - simplified with direct macro usage
+    // Get fields and count
     SV** fields = ObjectFIELDS(ref);
     I32 field_count = ObjectMAXFIELD(ref) + 1;
 
     if (!fields || field_count < 0)
         croak("Could not access object fields");
 
-    // Preallocate a reasonable size for the buffer (package + field count + basic overhead per field)
-    // This helps reduce reallocation during buffer growth
+    // Preallocate buffer
     STRLEN package_len = strlen(package);
     STRLEN initial_size = 1 + package_len + 1 + sizeof(field_count) + (field_count * 16);
 
-    // Start the output buffer
     SV* buffer = newSV(initial_size);
     sv_setpvn(buffer, "", 0);
 
-    // Format:
-    // - 1 byte type marker ('O' for object)
-    // - package name (null terminated)
-    // - number of fields (4 bytes)
-    // - fields data (variable)
-
-    // Write header
-    sv_catpvn(buffer, "O", 1);                          // Object type marker
-    sv_catpvn(buffer, package, package_len);            // Package name
-    sv_catpvn(buffer, "\0", 1);                         // Null terminator
-    sv_catpvn(buffer, (char*)&field_count, sizeof(field_count));  // Field count
+    // Format: type marker, package name, null terminator, field count, fields data
+    sv_catpvn(buffer, "O", 1);
+    sv_catpvn(buffer, package, package_len);
+    sv_catpvn(buffer, "\0", 1);
+    sv_catpvn(buffer, (char*)&field_count, sizeof(field_count));
 
     // Write each field
     I32 i;
@@ -96,42 +72,32 @@ static SV* serialize_object(SV* obj) {
         SV* field = fields[i];
 
         if (!field || !SvOK(field)) {
-            // Undefined field
             unsigned char type = 0;
             sv_catpvn(buffer, (char*)&type, 1);
             continue;
         }
 
-        // Handle field based on its type
         if (SvIOK(field)) {
-            // Integer
             unsigned char type = 1;
             IV value = SvIV(field);
-
             sv_catpvn(buffer, (char*)&type, 1);
             sv_catpvn(buffer, (char*)&value, sizeof(value));
         }
         else if (SvNOK(field)) {
-            // Double/float
             unsigned char type = 2;
             NV value = SvNV(field);
-
             sv_catpvn(buffer, (char*)&type, 1);
             sv_catpvn(buffer, (char*)&value, sizeof(value));
         }
         else if (SvPOK(field)) {
-            // String
             unsigned char type = 3;
             STRLEN len;
             const char* pv = SvPV_const(field, len);
-
             sv_catpvn(buffer, (char*)&type, 1);
             sv_catpvn(buffer, (char*)&len, sizeof(len));
             sv_catpvn(buffer, pv, len);
         }
         else {
-            // Not a simple scalar type, store as undefined
-            // No support for complex types in first draft
             unsigned char type = 0;
             sv_catpvn(buffer, (char*)&type, 1);
         }
@@ -140,18 +106,15 @@ static SV* serialize_object(SV* obj) {
     return buffer;
 }
 
-// Deserialize binary data directly into a newly created class object for maximum performance
-// Uses the constructor but avoids blessed hashrefs by working with feature class objects
+// Deserialize binary data into a class object
 static SV* deserialize_object(SV* binary) {
     STRLEN data_len;
     const char* data = SvPV_const(binary, data_len);
     const char* cur = data;
 
-    // Validate minimal length (at least type marker, package name, null terminator, and field count)
     if (data_len < (1 + 1 + 1 + sizeof(I32)))
         croak("Invalid binary data: too short");
 
-    // Check type marker
     if (*cur != 'O')
         croak("Invalid binary data: not an object");
     cur++;
@@ -160,7 +123,6 @@ static SV* deserialize_object(SV* binary) {
     const char* package = cur;
     STRLEN package_len = 0;
 
-    // Find null terminator and calculate package name length
     while (*cur && (size_t)(cur - data) < data_len) {
         cur++;
         package_len++;
@@ -169,7 +131,6 @@ static SV* deserialize_object(SV* binary) {
     if ((size_t)(cur - data) >= data_len)
         croak("Invalid binary data: missing null terminator");
 
-    // Skip null terminator
     cur++;
 
     // Extract field count
@@ -179,35 +140,28 @@ static SV* deserialize_object(SV* binary) {
     I32 field_count = *(const I32*)cur;
     cur += sizeof(I32);
 
-    if (field_count < 0 || field_count > 1000)  // Sanity check
+    if (field_count < 0 || field_count > 1000)
         croak("Invalid binary data: invalid field count %d", field_count);
 
-    // Create class name from package
+    // Create class name
     char class_name[package_len + 1];
     strncpy(class_name, package, package_len);
     class_name[package_len] = '\0';
 
-    // Create the stash (package symbol table)
+    // Create the stash
     HV* stash = gv_stashpvn(package, package_len, GV_ADD);
     if (!stash)
         croak("Could not find or create package '%.*s'", (int)package_len, package);
 
-    // Read all the field data
-    I32 i;
-    bool error = FALSE;
-
-    // Create a minimal array of parameter values to pass to our constructor
-    // We'll create our object with just new() and then set fields
+    // Call constructor
     dSP;
-
     ENTER;
     SAVETMPS;
 
     PUSHMARK(SP);
-    XPUSHs(sv_2mortal(newSVpv(class_name, 0)));  // class name
+    XPUSHs(sv_2mortal(newSVpv(class_name, 0)));
     PUTBACK;
 
-    // Call the constructor to get a proper class object
     int count = call_method("new", G_SCALAR);
     SPAGAIN;
 
@@ -220,13 +174,12 @@ static SV* deserialize_object(SV* binary) {
     }
 
     obj = POPs;
-    SvREFCNT_inc(obj); // Prevent it from being freed when we FREETMPS
+    SvREFCNT_inc(obj);
 
     PUTBACK;
     FREETMPS;
     LEAVE;
 
-    // Now we have a properly constructed class object, let's get its referent
     if (!is_class_object(obj)) {
         SvREFCNT_dec(obj);
         croak("Constructor for '%s' did not return a class object", class_name);
@@ -234,30 +187,24 @@ static SV* deserialize_object(SV* binary) {
 
     SV* ref = SvRV(obj);
 
-    // Verify we have the right field count - simplified with direct macro
+    // Populate fields
     I32 obj_field_count = ObjectMAXFIELD(ref) + 1;
     if (obj_field_count != field_count) {
-        // Warn but continue - this could happen if the class definition changed
         warn("Warning: serialized object has %d fields but class '%s' has %d fields",
              field_count, class_name, obj_field_count);
-
-        // Use the smaller count to avoid buffer overruns
         if (obj_field_count < field_count)
             field_count = obj_field_count;
     }
 
-    // Now populate the fields
+    I32 i;
+    bool error = FALSE;
     for (i = 0; i < field_count && !error; i++) {
-        // Check if we've reached the end of the data
         if ((size_t)(cur - data) >= data_len) {
             warn("Binary data ended prematurely, only %d of %d fields processed", i, field_count);
             break;
         }
 
-        // Get field type
         unsigned char type = *cur++;
-
-        // Create field based on type
         SV* field = NULL;
 
         switch (type) {
@@ -301,21 +248,17 @@ static SV* deserialize_object(SV* binary) {
                 }
                 break;
 
-            default: // Unknown type
+            default:
                 warn("Unknown field type %d at position %d", (int)type, (int)(cur - data - 1));
                 field = newSV(0);
                 break;
         }
 
         if (field) {
-            // Assign the field directly to the object
             SV** fields = ObjectFIELDS(ref);
             if (fields && i < field_count) {
-                // Release any existing value
                 if (fields[i])
                     SvREFCNT_dec(fields[i]);
-
-                // Assign the new value
                 fields[i] = field;
             } else {
                 SvREFCNT_dec(field);
@@ -334,36 +277,27 @@ static SV* deserialize_object(SV* binary) {
     return obj;
 }
 
-#ifdef HAVE_DUCKDB
-/* DuckDB connection type for internal use */
-typedef struct {
-    duckdb_database db;
-    duckdb_connection conn;
-    int is_open;
-} duckdb_handle;
-
-/* Function prototypes for internal use */
-static duckdb_handle* duckdb_internal_connect(const char* path);
-static void duckdb_internal_disconnect(duckdb_handle* handle);
-static int duckdb_internal_execute(duckdb_handle* handle, const char* query);
-static int duckdb_internal_store_object(duckdb_handle* handle, const char* collection, SV* obj);
-
-/* Implementation of internal functions */
-static duckdb_handle* duckdb_internal_connect(const char* path) {
-    duckdb_handle* handle = (duckdb_handle*)safemalloc(sizeof(duckdb_handle));
+// ECS DuckDB implementation
+static ecs_duckdb_handle* ecs_duckdb_connect(const char* path) {
+    ecs_duckdb_handle* handle = (ecs_duckdb_handle*)safemalloc(sizeof(ecs_duckdb_handle));
     if (!handle) {
         return NULL;
     }
 
-    /* Initialize the database */
+    // Store path for later use
+    size_t path_len = strlen(path);
+    handle->db_path = (char*)safemalloc(path_len + 1);
+    strcpy(handle->db_path, path);
+
     if (duckdb_open(path, &handle->db) != DuckDBSuccess) {
+        Safefree(handle->db_path);
         Safefree(handle);
         return NULL;
     }
 
-    /* Create a connection */
     if (duckdb_connect(handle->db, &handle->conn) != DuckDBSuccess) {
         duckdb_close(&handle->db);
+        Safefree(handle->db_path);
         Safefree(handle);
         return NULL;
     }
@@ -372,7 +306,7 @@ static duckdb_handle* duckdb_internal_connect(const char* path) {
     return handle;
 }
 
-static void duckdb_internal_disconnect(duckdb_handle* handle) {
+static void ecs_duckdb_disconnect(ecs_duckdb_handle* handle) {
     if (!handle || !handle->is_open) {
         return;
     }
@@ -380,83 +314,95 @@ static void duckdb_internal_disconnect(duckdb_handle* handle) {
     duckdb_disconnect(&handle->conn);
     duckdb_close(&handle->db);
     handle->is_open = 0;
+    
+    if (handle->db_path) {
+        Safefree(handle->db_path);
+    }
     Safefree(handle);
 }
 
-static int duckdb_internal_execute(duckdb_handle* handle, const char* query) {
+static int ecs_duckdb_execute(ecs_duckdb_handle* handle, const char* query) {
     if (!handle || !handle->is_open) {
         return 0;
     }
 
-    return (duckdb_query(handle->conn, query, NULL) == DuckDBSuccess);
-}
-
-static int duckdb_internal_store_object(duckdb_handle* handle, const char* collection, SV* obj) {
-    if (!handle || !handle->is_open || !collection) {
-        return 0;
-    }
-
-    /* Validate object */
-    if (!is_class_object(obj)) {
-        return 0;
-    }
-
-    /* Get class name */
-    SV* ref = SvRV(obj);
-    HV* stash = SvSTASH(ref);
-    const char* class_name = HvNAME(stash);
-
-    /* Serialize the object */
-    SV* binary = serialize_object(obj);
-    STRLEN binary_len;
-    const char* binary_data = SvPV_const(binary, binary_len);
-
-    /* Ensure the collection exists */
-    char create_query[1024];
-    sprintf(create_query, "CREATE TABLE IF NOT EXISTS %s (id INTEGER PRIMARY KEY, class_name TEXT, binary_data BLOB)",
-            collection);
-
-    if (!duckdb_internal_execute(handle, create_query)) {
-        SvREFCNT_dec(binary);
-        return 0;
-    }
-
-    /* Prepare statement for insert */
-    duckdb_prepared_statement stmt;
-    char query[1024];
-    sprintf(query, "INSERT INTO %s (class_name, binary_data) VALUES (?, ?)", collection);
-
-    if (duckdb_prepare(handle->conn, query, &stmt) != DuckDBSuccess) {
-        SvREFCNT_dec(binary);
-        return 0;
-    }
-
-    /* Bind parameters */
-    int success = 1;
-    if (duckdb_bind_varchar(stmt, 1, class_name) != DuckDBSuccess ||
-        duckdb_bind_blob(stmt, 2, binary_data, binary_len) != DuckDBSuccess) {
-        success = 0;
-    }
-
-    /* Execute and clean up */
-    if (success && duckdb_execute_prepared(stmt, NULL) != DuckDBSuccess) {
-        success = 0;
-    }
-
-    duckdb_destroy_prepare(&stmt);
-    SvREFCNT_dec(binary);
-
+    duckdb_result result;
+    int success = (duckdb_query(handle->conn, query, &result) == DuckDBSuccess);
+    duckdb_destroy_result(&result);
     return success;
 }
-#endif /* HAVE_DUCKDB */
+
+static int ecs_duckdb_init_schema(ecs_duckdb_handle* handle, const char* world_name) {
+    if (!handle || !handle->is_open) {
+        return 0;
+    }
+
+    char query[2048];
+
+    // Create entities table
+    snprintf(query, sizeof(query),
+        "CREATE TABLE IF NOT EXISTS %s_entities ("
+        "entity_id INTEGER PRIMARY KEY, "
+        "exists BOOLEAN DEFAULT TRUE, "
+        "created_at BIGINT, "
+        "deleted_at BIGINT DEFAULT NULL"
+        ")", world_name);
+    if (!ecs_duckdb_execute(handle, query)) return 0;
+
+    // Create components table
+    snprintf(query, sizeof(query),
+        "CREATE TABLE IF NOT EXISTS %s_components ("
+        "entity_id INTEGER, "
+        "component_type TEXT, "
+        "component_data BLOB, "
+        "created_at BIGINT, "
+        "PRIMARY KEY (entity_id, component_type)"
+        ")", world_name);
+    if (!ecs_duckdb_execute(handle, query)) return 0;
+
+    // Create tags table
+    snprintf(query, sizeof(query),
+        "CREATE TABLE IF NOT EXISTS %s_tags ("
+        "entity_id INTEGER, "
+        "tag TEXT, "
+        "created_at BIGINT, "
+        "PRIMARY KEY (entity_id, tag)"
+        ")", world_name);
+    if (!ecs_duckdb_execute(handle, query)) return 0;
+
+    // Create component_types registry
+    snprintf(query, sizeof(query),
+        "CREATE TABLE IF NOT EXISTS %s_component_types ("
+        "type_name TEXT PRIMARY KEY, "
+        "registered_at BIGINT"
+        ")", world_name);
+    if (!ecs_duckdb_execute(handle, query)) return 0;
+
+    // Create indexes for performance
+    snprintf(query, sizeof(query),
+        "CREATE INDEX IF NOT EXISTS %s_entities_exists_idx ON %s_entities(exists)",
+        world_name, world_name);
+    if (!ecs_duckdb_execute(handle, query)) return 0;
+
+    snprintf(query, sizeof(query),
+        "CREATE INDEX IF NOT EXISTS %s_components_type_idx ON %s_components(component_type)",
+        world_name, world_name);
+    if (!ecs_duckdb_execute(handle, query)) return 0;
+
+    snprintf(query, sizeof(query),
+        "CREATE INDEX IF NOT EXISTS %s_tags_tag_idx ON %s_tags(tag)",
+        world_name, world_name);
+    if (!ecs_duckdb_execute(handle, query)) return 0;
+
+    return 1;
+}
 
 MODULE = ECS::XS::Binary    PACKAGE = ECS::XS::Binary
 
 BOOT:
 {
-    /* Check that we're running on Perl 5.38 or later */
-    if (PERL_VERSION_LE(5,38,'*')) {
-        croak("This module requires Perl 5.38 or later (found %d.%d.%d)",
+    if (PERL_REVISION < 5 || (PERL_REVISION == 5 && PERL_VERSION < 40)) {
+        croak("This module requires Perl 5.40 or later (found %d.%d.%d)",
               PERL_REVISION, PERL_VERSION, PERL_SUBVERSION);
     }
 }
@@ -489,24 +435,36 @@ I32
 field_count(obj)
     SV* obj
     CODE:
-        /* Validate input */
         if (!obj || !SvROK(obj))
             croak("Not a valid object reference");
 
         if (!is_class_object(obj))
             croak("Not a feature class object");
 
-        /* Get the actual object */
         SV* ref = SvRV(obj);
-
-        /* Get field count - simplified with direct macro */
         RETVAL = ObjectMAXFIELD(ref) + 1;
     OUTPUT:
         RETVAL
 
 SV*
-create_world()
+create_world(db_path, world_name = "ecs_world")
+    const char* db_path
+    const char* world_name
     CODE:
+        // Connect to database and initialize schema
+        ecs_duckdb_handle* handle = ecs_duckdb_connect(db_path);
+        if (!handle) {
+            croak("Failed to connect to database at %s", db_path);
+        }
+
+        if (!ecs_duckdb_init_schema(handle, world_name)) {
+            ecs_duckdb_disconnect(handle);
+            croak("Failed to initialize ECS schema in database");
+        }
+
+        ecs_duckdb_disconnect(handle);
+
+        // Create World object
         SV* world;
         dSP;
 
@@ -515,6 +473,10 @@ create_world()
 
         PUSHMARK(SP);
         XPUSHs(sv_2mortal(newSVpv("ECS::XS::Binary::World", 0)));
+        XPUSHs(sv_2mortal(newSVpv("db_path", 0)));
+        XPUSHs(sv_2mortal(newSVpv(db_path, 0)));
+        XPUSHs(sv_2mortal(newSVpv("world_name", 0)));
+        XPUSHs(sv_2mortal(newSVpv(world_name, 0)));
         PUTBACK;
 
         int count = call_method("new", G_SCALAR);
@@ -535,131 +497,423 @@ create_world()
     OUTPUT:
         RETVAL
 
-#ifdef HAVE_DUCKDB
+int
+ecs_create_entity(db_path, world_name, entity_id, created_at)
+    const char* db_path
+    const char* world_name
+    int entity_id
+    long created_at
+    CODE:
+        ecs_duckdb_handle* handle = ecs_duckdb_connect(db_path);
+        if (!handle) {
+            croak("Failed to connect to database");
+        }
+
+        char query[512];
+        snprintf(query, sizeof(query),
+            "INSERT INTO %s_entities (entity_id, exists, created_at) VALUES (%d, TRUE, %ld)",
+            world_name, entity_id, created_at);
+
+        RETVAL = ecs_duckdb_execute(handle, query);
+        ecs_duckdb_disconnect(handle);
+    OUTPUT:
+        RETVAL
+
+int
+ecs_destroy_entity(db_path, world_name, entity_id, deleted_at)
+    const char* db_path
+    const char* world_name
+    int entity_id
+    long deleted_at
+    CODE:
+        ecs_duckdb_handle* handle = ecs_duckdb_connect(db_path);
+        if (!handle) {
+            croak("Failed to connect to database");
+        }
+
+        char query[1024];
+        
+        // Mark entity as deleted
+        snprintf(query, sizeof(query),
+            "UPDATE %s_entities SET exists = FALSE, deleted_at = %ld WHERE entity_id = %d",
+            world_name, deleted_at, entity_id);
+        
+        if (!ecs_duckdb_execute(handle, query)) {
+            ecs_duckdb_disconnect(handle);
+            RETVAL = 0;
+            return;
+        }
+
+        // Remove all components
+        snprintf(query, sizeof(query),
+            "DELETE FROM %s_components WHERE entity_id = %d",
+            world_name, entity_id);
+        
+        if (!ecs_duckdb_execute(handle, query)) {
+            ecs_duckdb_disconnect(handle);
+            RETVAL = 0;
+            return;
+        }
+
+        // Remove all tags
+        snprintf(query, sizeof(query),
+            "DELETE FROM %s_tags WHERE entity_id = %d",
+            world_name, entity_id);
+        
+        RETVAL = ecs_duckdb_execute(handle, query);
+        ecs_duckdb_disconnect(handle);
+    OUTPUT:
+        RETVAL
+
+int
+ecs_entity_exists(db_path, world_name, entity_id)
+    const char* db_path
+    const char* world_name
+    int entity_id
+    CODE:
+        ecs_duckdb_handle* handle = ecs_duckdb_connect(db_path);
+        if (!handle) {
+            croak("Failed to connect to database");
+        }
+
+        char query[512];
+        snprintf(query, sizeof(query),
+            "SELECT COUNT(*) FROM %s_entities WHERE entity_id = %d AND exists = TRUE",
+            world_name, entity_id);
+
+        duckdb_result result;
+        if (duckdb_query(handle->conn, query, &result) != DuckDBSuccess) {
+            ecs_duckdb_disconnect(handle);
+            croak("Failed to check entity existence");
+        }
+
+        RETVAL = (duckdb_row_count(&result) > 0 && duckdb_value_int64(&result, 0, 0) > 0) ? 1 : 0;
+        
+        duckdb_destroy_result(&result);
+        ecs_duckdb_disconnect(handle);
+    OUTPUT:
+        RETVAL
+
+int
+ecs_register_component_type(db_path, world_name, type_name, registered_at)
+    const char* db_path
+    const char* world_name
+    const char* type_name
+    long registered_at
+    CODE:
+        ecs_duckdb_handle* handle = ecs_duckdb_connect(db_path);
+        if (!handle) {
+            croak("Failed to connect to database");
+        }
+
+        char query[512];
+        snprintf(query, sizeof(query),
+            "INSERT OR IGNORE INTO %s_component_types (type_name, registered_at) VALUES ('%s', %ld)",
+            world_name, type_name, registered_at);
+
+        RETVAL = ecs_duckdb_execute(handle, query);
+        ecs_duckdb_disconnect(handle);
+    OUTPUT:
+        RETVAL
+
+int
+ecs_add_component(db_path, world_name, entity_id, component_type, component_obj, created_at)
+    const char* db_path
+    const char* world_name
+    int entity_id
+    const char* component_type
+    SV* component_obj
+    long created_at
+    CODE:
+        if (!is_class_object(component_obj)) {
+            croak("Component must be a class object");
+        }
+
+        ecs_duckdb_handle* handle = ecs_duckdb_connect(db_path);
+        if (!handle) {
+            croak("Failed to connect to database");
+        }
+
+        // Serialize the component
+        SV* binary = serialize_object(component_obj);
+        STRLEN binary_len;
+        const char* binary_data = SvPV_const(binary, binary_len);
+
+        // Prepare insert statement
+        char query[512];
+        snprintf(query, sizeof(query),
+            "INSERT OR REPLACE INTO %s_components (entity_id, component_type, component_data, created_at) VALUES (?, ?, ?, ?)",
+            world_name);
+
+        duckdb_prepared_statement stmt;
+        if (duckdb_prepare(handle->conn, query, &stmt) != DuckDBSuccess) {
+            SvREFCNT_dec(binary);
+            ecs_duckdb_disconnect(handle);
+            croak("Failed to prepare component insert statement");
+        }
+
+        int success = 1;
+        if (duckdb_bind_int32(stmt, 1, entity_id) != DuckDBSuccess ||
+            duckdb_bind_varchar(stmt, 2, component_type) != DuckDBSuccess ||
+            duckdb_bind_blob(stmt, 3, binary_data, binary_len) != DuckDBSuccess ||
+            duckdb_bind_int64(stmt, 4, created_at) != DuckDBSuccess) {
+            success = 0;
+        }
+
+        if (success && duckdb_execute_prepared(stmt, NULL) != DuckDBSuccess) {
+            success = 0;
+        }
+
+        duckdb_destroy_prepare(&stmt);
+        SvREFCNT_dec(binary);
+        ecs_duckdb_disconnect(handle);
+
+        RETVAL = success;
+    OUTPUT:
+        RETVAL
 
 SV*
-store_object(db_path, collection, obj)
+ecs_get_component(db_path, world_name, entity_id, component_type)
     const char* db_path
-    const char* collection
-    SV* obj
+    const char* world_name
+    int entity_id
+    const char* component_type
     CODE:
-        /* Validate the object is a proper feature class object */
-        if (!is_class_object(obj)) {
-            croak("Not a feature class object");
-        }
-
-        /* Connect to the database */
-        duckdb_handle* handle = duckdb_internal_connect(db_path);
+        ecs_duckdb_handle* handle = ecs_duckdb_connect(db_path);
         if (!handle) {
-            croak("Failed to connect to database at %s", db_path);
+            croak("Failed to connect to database");
         }
 
-        /* Store the object */
-        int success = duckdb_internal_store_object(handle, collection, obj);
+        char query[512];
+        snprintf(query, sizeof(query),
+            "SELECT component_data FROM %s_components WHERE entity_id = %d AND component_type = '%s'",
+            world_name, entity_id, component_type);
 
-        /* Disconnect */
-        duckdb_internal_disconnect(handle);
-
-        if (!success) {
-            croak("Failed to store object in collection %s", collection);
+        duckdb_result result;
+        if (duckdb_query(handle->conn, query, &result) != DuckDBSuccess) {
+            ecs_duckdb_disconnect(handle);
+            croak("Failed to retrieve component");
         }
 
-        /* Return true on success */
-        RETVAL = newSViv(1);
+        if (duckdb_row_count(&result) == 0) {
+            duckdb_destroy_result(&result);
+            ecs_duckdb_disconnect(handle);
+            RETVAL = &PL_sv_undef;
+        } else {
+            duckdb_blob blob_result = duckdb_value_blob(&result, 0, 0);
+            const void* binary_data = blob_result.data;
+            idx_t binary_len = blob_result.size;
+
+            SV* binary = newSVpvn((const char*)binary_data, binary_len);
+            RETVAL = deserialize_object(binary);
+            SvREFCNT_dec(binary);
+
+            duckdb_destroy_result(&result);
+        }
+
+        ecs_duckdb_disconnect(handle);
+    OUTPUT:
+        RETVAL
+
+int
+ecs_remove_component(db_path, world_name, entity_id, component_type)
+    const char* db_path
+    const char* world_name
+    int entity_id
+    const char* component_type
+    CODE:
+        ecs_duckdb_handle* handle = ecs_duckdb_connect(db_path);
+        if (!handle) {
+            croak("Failed to connect to database");
+        }
+
+        char query[512];
+        snprintf(query, sizeof(query),
+            "DELETE FROM %s_components WHERE entity_id = %d AND component_type = '%s'",
+            world_name, entity_id, component_type);
+
+        RETVAL = ecs_duckdb_execute(handle, query);
+        ecs_duckdb_disconnect(handle);
+    OUTPUT:
+        RETVAL
+
+int
+ecs_has_component(db_path, world_name, entity_id, component_type)
+    const char* db_path
+    const char* world_name
+    int entity_id
+    const char* component_type
+    CODE:
+        ecs_duckdb_handle* handle = ecs_duckdb_connect(db_path);
+        if (!handle) {
+            croak("Failed to connect to database");
+        }
+
+        char query[512];
+        snprintf(query, sizeof(query),
+            "SELECT COUNT(*) FROM %s_components WHERE entity_id = %d AND component_type = '%s'",
+            world_name, entity_id, component_type);
+
+        duckdb_result result;
+        if (duckdb_query(handle->conn, query, &result) != DuckDBSuccess) {
+            ecs_duckdb_disconnect(handle);
+            croak("Failed to check component existence");
+        }
+
+        RETVAL = (duckdb_row_count(&result) > 0 && duckdb_value_int64(&result, 0, 0) > 0) ? 1 : 0;
+        
+        duckdb_destroy_result(&result);
+        ecs_duckdb_disconnect(handle);
+    OUTPUT:
+        RETVAL
+
+int
+ecs_add_tag(db_path, world_name, entity_id, tag, created_at)
+    const char* db_path
+    const char* world_name
+    int entity_id
+    const char* tag
+    long created_at
+    CODE:
+        ecs_duckdb_handle* handle = ecs_duckdb_connect(db_path);
+        if (!handle) {
+            croak("Failed to connect to database");
+        }
+
+        char query[512];
+        snprintf(query, sizeof(query),
+            "INSERT OR IGNORE INTO %s_tags (entity_id, tag, created_at) VALUES (%d, '%s', %ld)",
+            world_name, entity_id, tag, created_at);
+
+        RETVAL = ecs_duckdb_execute(handle, query);
+        ecs_duckdb_disconnect(handle);
+    OUTPUT:
+        RETVAL
+
+int
+ecs_remove_tag(db_path, world_name, entity_id, tag)
+    const char* db_path
+    const char* world_name
+    int entity_id
+    const char* tag
+    CODE:
+        ecs_duckdb_handle* handle = ecs_duckdb_connect(db_path);
+        if (!handle) {
+            croak("Failed to connect to database");
+        }
+
+        char query[512];
+        snprintf(query, sizeof(query),
+            "DELETE FROM %s_tags WHERE entity_id = %d AND tag = '%s'",
+            world_name, entity_id, tag);
+
+        RETVAL = ecs_duckdb_execute(handle, query);
+        ecs_duckdb_disconnect(handle);
+    OUTPUT:
+        RETVAL
+
+int
+ecs_has_tag(db_path, world_name, entity_id, tag)
+    const char* db_path
+    const char* world_name
+    int entity_id
+    const char* tag
+    CODE:
+        ecs_duckdb_handle* handle = ecs_duckdb_connect(db_path);
+        if (!handle) {
+            croak("Failed to connect to database");
+        }
+
+        char query[512];
+        snprintf(query, sizeof(query),
+            "SELECT COUNT(*) FROM %s_tags WHERE entity_id = %d AND tag = '%s'",
+            world_name, entity_id, tag);
+
+        duckdb_result result;
+        if (duckdb_query(handle->conn, query, &result) != DuckDBSuccess) {
+            ecs_duckdb_disconnect(handle);
+            croak("Failed to check tag existence");
+        }
+
+        RETVAL = (duckdb_row_count(&result) > 0 && duckdb_value_int64(&result, 0, 0) > 0) ? 1 : 0;
+        
+        duckdb_destroy_result(&result);
+        ecs_duckdb_disconnect(handle);
     OUTPUT:
         RETVAL
 
 void
-retrieve_objects(db_path, collection, class_name, ...)
+ecs_query_entities_with_component(db_path, world_name, component_type)
     const char* db_path
-    const char* collection
-    const char* class_name
+    const char* world_name
+    const char* component_type
     PPCODE:
-        /* Connect to the database */
-        duckdb_handle* handle = duckdb_internal_connect(db_path);
+        ecs_duckdb_handle* handle = ecs_duckdb_connect(db_path);
         if (!handle) {
-            croak("Failed to connect to database at %s", db_path);
+            croak("Failed to connect to database");
         }
 
-        /* Optional WHERE clause */
-        const char* where_clause = "";
-        if (items > 3) {
-            where_clause = SvPV_nolen(ST(3));
-        }
+        char query[512];
+        snprintf(query, sizeof(query),
+            "SELECT DISTINCT c.entity_id FROM %s_components c "
+            "JOIN %s_entities e ON c.entity_id = e.entity_id "
+            "WHERE c.component_type = '%s' AND e.exists = TRUE "
+            "ORDER BY c.entity_id",
+            world_name, world_name, component_type);
 
-        /* Build the query */
-        char query[1024];
-        sprintf(query, "SELECT binary_data FROM %s WHERE class_name = '%s' %s",
-                collection, class_name, where_clause);
-
-        /* Execute the query */
         duckdb_result result;
         if (duckdb_query(handle->conn, query, &result) != DuckDBSuccess) {
-            duckdb_internal_disconnect(handle);
-            const char* error = duckdb_result_error(&result);
-            croak("Failed to retrieve objects: %s", error ? error : "Unknown error");
+            ecs_duckdb_disconnect(handle);
+            croak("Failed to query entities with component");
         }
 
-        /* Process each row */
         idx_t row_count = duckdb_row_count(&result);
         if (row_count > 0) {
             EXTEND(SP, row_count);
-
             idx_t i;
             for (i = 0; i < row_count; i++) {
-                /* Get the binary data using correct DuckDB API functions */
-                /* duckdb_blob contains both data and size fields */
-                duckdb_blob blob_result = duckdb_value_blob(&result, 0, i);
-                const void* binary_data = blob_result.data;
-                idx_t binary_len = blob_result.size;
-
-                /* Create a Perl scalar with the binary data */
-                SV* binary = newSVpvn((const char*)binary_data, binary_len);
-
-                /* Deserialize to object */
-                SV* obj = deserialize_object(binary);
-
-                /* Add to the result stack */
-                PUSHs(sv_2mortal(obj));
-
-                /* Free the temporary binary value */
-                SvREFCNT_dec(binary);
+                int entity_id = duckdb_value_int32(&result, 0, i);
+                PUSHs(sv_2mortal(newSViv(entity_id)));
             }
         }
 
-        /* Clean up */
         duckdb_destroy_result(&result);
-        duckdb_internal_disconnect(handle);
+        ecs_duckdb_disconnect(handle);
 
 void
-delete_objects(db_path, collection, class_name, ...)
+ecs_query_entities_with_tag(db_path, world_name, tag)
     const char* db_path
-    const char* collection
-    const char* class_name
-    CODE:
-        /* Connect to the database */
-        duckdb_handle* handle = duckdb_internal_connect(db_path);
+    const char* world_name
+    const char* tag
+    PPCODE:
+        ecs_duckdb_handle* handle = ecs_duckdb_connect(db_path);
         if (!handle) {
-            croak("Failed to connect to database at %s", db_path);
+            croak("Failed to connect to database");
         }
 
-        /* Optional WHERE clause */
-        const char* where_clause = "";
-        if (items > 3) {
-            where_clause = SvPV_nolen(ST(3));
+        char query[512];
+        snprintf(query, sizeof(query),
+            "SELECT DISTINCT t.entity_id FROM %s_tags t "
+            "JOIN %s_entities e ON t.entity_id = e.entity_id "
+            "WHERE t.tag = '%s' AND e.exists = TRUE "
+            "ORDER BY t.entity_id",
+            world_name, world_name, tag);
+
+        duckdb_result result;
+        if (duckdb_query(handle->conn, query, &result) != DuckDBSuccess) {
+            ecs_duckdb_disconnect(handle);
+            croak("Failed to query entities with tag");
         }
 
-        /* Build the query */
-        char query[1024];
-        sprintf(query, "DELETE FROM %s WHERE class_name = '%s' %s",
-                collection, class_name, where_clause);
-
-        /* Execute the query */
-        if (!duckdb_internal_execute(handle, query)) {
-            duckdb_internal_disconnect(handle);
-            croak("Failed to delete objects");
+        idx_t row_count = duckdb_row_count(&result);
+        if (row_count > 0) {
+            EXTEND(SP, row_count);
+            idx_t i;
+            for (i = 0; i < row_count; i++) {
+                int entity_id = duckdb_value_int32(&result, 0, i);
+                PUSHs(sv_2mortal(newSViv(entity_id)));
+            }
         }
 
-        duckdb_internal_disconnect(handle);
-
-#endif /* HAVE_DUCKDB */
+        duckdb_destroy_result(&result);
+        ecs_duckdb_disconnect(handle);

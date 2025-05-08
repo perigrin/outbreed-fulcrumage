@@ -5,3 +5,17 @@ test_module.pl
 Makefile.
 Makefile.old
 CLAUDE.md
+local
+
+# Build artifacts
+Binary.bs
+Binary.c
+Binary.o
+MYMETA.json
+MYMETA.yml
+Makefile
+blib/
+pm_to_blib
+
+# Test artifacts
+*.duckdb

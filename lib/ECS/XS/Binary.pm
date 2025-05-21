@@ -11,10 +11,20 @@ our @EXPORT_OK = qw(
     deserialize
     is_class_object
     field_count
-    store_object
-    retrieve_objects
-    delete_objects
     create_world
+    ecs_create_entity
+    ecs_destroy_entity
+    ecs_entity_exists
+    ecs_register_component_type
+    ecs_add_component
+    ecs_get_component
+    ecs_remove_component
+    ecs_has_component
+    ecs_add_tag
+    ecs_remove_tag
+    ecs_has_tag
+    ecs_query_entities_with_component
+    ecs_query_entities_with_tag
 );
 
 XSLoader::load('ECS::XS::Binary', $VERSION);

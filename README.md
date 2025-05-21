@@ -27,15 +27,43 @@ This module is intended as part of a larger ECS (Entity Component System) implem
 * Perl 5.40 or newer (for `feature class` support)
 * C compiler for building the XS module
 * ExtUtils::MakeMaker for installation
+* Alien::DuckDB (automatically installed as a dependency)
 
 ## Installation
 
 ```bash
+# From CPAN
+cpanm ECS::XS::Binary
+
+# From source
+cpanm --installdeps .
 perl Makefile.PL
 make
 make test
 make install
 ```
+
+## For Developers
+
+This module uses Alien::DuckDB to provide the DuckDB library and headers. When developing:
+
+1. Install the necessary dependencies:
+   ```bash
+   cpanm --installdeps .
+   ```
+
+2. Test locally with:
+   ```bash
+   perl Makefile.PL
+   make
+   prove -blv t/
+   ```
+
+3. Test GitHub workflows locally with the provided script:
+   ```bash
+   ./test_with_act.sh
+   ```
+   This uses [act](https://github.com/nektos/act) to run the GitHub workflow locally.
 
 ## Example Usage
 
